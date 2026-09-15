@@ -5,26 +5,27 @@ from aiohttp import web, ClientSession, TCPConnector
 TELEGRAM_API = "https://api.telegram.org"
 PORT = int(os.environ.get("PORT", 8080))
 
-# هدرهایی که نباید فوروارد شوند
+# هدرهایی که hop-by-hop هستند و نباید فوروارد شوند
 HOP_HEADERS = {
-    "host", "connection", "keep-alive", "proxy-authenticate",
-    "proxy-authorization", "te", "trailers",
-    "transfer-encoding", "upgrade", "content-length",
+    "host", "connection", "keep-alive",
+    "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    "content-length",  # aiohttp خودش محاسبه می‌کند
 }
 
-# کلاینت سراسری (Connection Pooling)
 session: ClientSession = None
 
 
 async def init_session(app: web.Application):
     global session
     connector = TCPConnector(
-        limit=200,              # حداکثر اتصال همزمان
+        limit=200,
         limit_per_host=200,
-        ttl_dns_cache=300,      # کش DNS برای سرعت
+        ttl_dns_cache=300,
         enable_cleanup_closed=True,
+        ssl=False,  # ← اختیاری: اگر مشکل SSL داشتید
     )
-    timeout = aiohttp.ClientTimeout(total=120, connect=10)
+    timeout = aiohttp.ClientTimeout(total=300, connect=15, sock_read=300)
     session = ClientSession(connector=connector, timeout=timeout)
 
 
@@ -33,16 +34,18 @@ async def close_session(app: web.Application):
 
 
 async def proxy(request: web.Request) -> web.StreamResponse:
-    # ساخت URL مقصد
     path = request.match_info["path"]
     url = f"{TELEGRAM_API}/{path}"
     if request.query_string:
         url += f"?{request.query_string}"
 
-    # هدرها
-    headers = {k: v for k, v in request.headers.items()
-               if k.lower() not in HOP_HEADERS}
+    # هدرها را فیلتر کن (content-type حفظ می‌شود)
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_HEADERS
+    }
 
+    # بدنه خام — چه JSON، چه form-data، چه multipart، چه binary
     body = await request.read()
 
     try:
@@ -53,17 +56,19 @@ async def proxy(request: web.Request) -> web.StreamResponse:
             data=body if body else None,
             allow_redirects=True,
         ) as resp:
-            # پاسخ استریم (برای فایل‌های حجیم عالی است)
-            out = web.StreamResponse(
-                status=resp.status,
-                headers={
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in HOP_HEADERS and k.lower() != "content-encoding"
-                },
-            )
+            # هدرهای پاسخ را کپی کن (content-type، content-disposition و...)
+            out_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in HOP_HEADERS
+                and k.lower() != "content-encoding"  # aiohttp خودش دیکد می‌کند
+            }
+            out = web.StreamResponse(status=resp.status, headers=out_headers)
             await out.prepare(request)
+
+            # استریم پاسخ — برای فایل‌های حجیم عالی است
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 await out.write(chunk)
+
             await out.write_eof()
             return out
 
@@ -83,7 +88,8 @@ async def health(_):
     return web.json_response({"status": "ok"})
 
 
-app = web.Application(client_max_size=100 * 1024 * 1024)  # 100MB
+# client_max_size باید بزرگ باشد برای آپلود فایل‌های حجیم
+app = web.Application(client_max_size=1024 * 1024 * 1024)  # 1GB
 app.on_startup.append(init_session)
 app.on_cleanup.append(close_session)
 app.router.add_route("*", "/health", health)
